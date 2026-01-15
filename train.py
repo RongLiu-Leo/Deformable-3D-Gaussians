@@ -22,6 +22,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+from torch.utils.data import DataLoader
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -42,11 +43,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    batch_size = args.batch_size
 
     iter_start = torch.cuda.Event(enable_timing=True)
     iter_end = torch.cuda.Event(enable_timing=True)
 
-    viewpoint_stack = None
+    training_dataset = scene.getTrainCameras()
+    training_dataloader = DataLoader(training_dataset, batch_size=batch_size, shuffle=True, collate_fn=lambda x: x, drop_last=True)
+    total_frame = len(training_dataset)
+    time_interval = 1 / total_frame
+    
     ema_loss_for_log = 0.0
     best_psnr = 0.0
     best_iteration = 0
@@ -75,39 +81,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-        # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
+        batch_data = next(iter(training_dataloader))
+        total_loss = 0.0
+        for batch_idx in range(batch_size):
+            gt_image, viewpoint_cam = batch_data[batch_idx]
+            gt_image = gt_image.cuda()
+            viewpoint_cam = viewpoint_cam.cuda()
 
-        total_frame = len(viewpoint_stack)
-        time_interval = 1 / total_frame
+            fid = viewpoint_cam.fid
 
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
-        if dataset.load2gpu_on_the_fly:
-            viewpoint_cam.load2device()
-        fid = viewpoint_cam.fid
+            if iteration < opt.warm_up:
+                d_xyz, d_rotation, d_scaling = 0.0, 0.0, 0.0
+            else:
+                N = gaussians.get_xyz.shape[0]
+                time_input = fid.unsqueeze(0).expand(N, -1)
 
-        if iteration < opt.warm_up:
-            d_xyz, d_rotation, d_scaling = 0.0, 0.0, 0.0
-        else:
-            N = gaussians.get_xyz.shape[0]
-            time_input = fid.unsqueeze(0).expand(N, -1)
+                ast_noise = 0 if dataset.is_blender else torch.randn(1, 1, device='cuda').expand(N, -1) * time_interval * smooth_term(iteration)
+                d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise)
 
-            ast_noise = 0 if dataset.is_blender else torch.randn(1, 1, device='cuda').expand(N, -1) * time_interval * smooth_term(iteration)
-            d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input + ast_noise)
+            # Render
+            render_pkg_re = render(viewpoint_cam, gaussians, pipe, background, d_xyz, d_rotation, d_scaling, dataset.is_6dof)
+            image, viewspace_point_tensor, visibility_filter, radii = render_pkg_re["render"], render_pkg_re[
+                "viewspace_points"], render_pkg_re["visibility_filter"], render_pkg_re["radii"]
+            # depth = render_pkg_re["depth"]
 
-        # Render
-        render_pkg_re = render(viewpoint_cam, gaussians, pipe, background, d_xyz, d_rotation, d_scaling, dataset.is_6dof)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg_re["render"], render_pkg_re[
-            "viewspace_points"], render_pkg_re["visibility_filter"], render_pkg_re["radii"]
-        # depth = render_pkg_re["depth"]
+            # Loss
+            Ll1 = l1_loss(image, gt_image)
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+            total_loss += loss
 
-        # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        loss = total_loss / batch_size
         loss.backward()
-
         iter_end.record()
 
         if dataset.load2gpu_on_the_fly:
@@ -207,27 +211,26 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             if config['cameras'] and len(config['cameras']) > 0:
                 images = torch.tensor([], device="cuda")
                 gts = torch.tensor([], device="cuda")
-                for idx, viewpoint in enumerate(config['cameras']):
-                    if load2gpu_on_the_fly:
-                        viewpoint.load2device()
-                    fid = viewpoint.fid
+                for idx, (gt_image, viewpoint_cam) in enumerate(config['cameras']):
+                    gt_image = gt_image.cuda()
+                    viewpoint_cam = viewpoint_cam.cuda()
+                    fid = viewpoint_cam.fid
                     xyz = scene.gaussians.get_xyz
                     time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
                     d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
                     image = torch.clamp(
-                        renderFunc(viewpoint, scene.gaussians, *renderArgs, d_xyz, d_rotation, d_scaling, is_6dof)["render"],
+                        renderFunc(viewpoint_cam, scene.gaussians, *renderArgs, d_xyz, d_rotation, d_scaling, is_6dof)["render"],
                         0.0, 1.0)
-                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     images = torch.cat((images, image.unsqueeze(0)), dim=0)
                     gts = torch.cat((gts, gt_image.unsqueeze(0)), dim=0)
 
                     if load2gpu_on_the_fly:
-                        viewpoint.load2device('cpu')
+                        viewpoint_cam.load2device('cpu')
                     if tb_writer and (idx < 5):
-                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name),
+                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint_cam.image_name),
                                              image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name),
+                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint_cam.image_name),
                                                  gt_image[None], global_step=iteration)
 
                 l1_test = l1_loss(images, gts)
@@ -257,7 +260,7 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int,
-                        default=[5000, 6000, 7_000] + list(range(10000, 40001, 1000)))
+                        default=[100, 5000, 6000, 7_000] + list(range(10000, 40001, 1000)))
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 10_000, 20_000, 30_000, 40000])
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(sys.argv[1:])
