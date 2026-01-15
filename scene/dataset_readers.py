@@ -28,7 +28,7 @@ import json
 from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
-from scene.beta_model import BasicPointCloud
+from scene.gaussian_model import BasicPointCloud
 from dataclasses import dataclass
 from tqdm import tqdm
 import imagesize
