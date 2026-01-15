@@ -48,7 +48,7 @@ class CameraInfo:
     image_name: str
     width: int
     height: int
-    timestamp: float = 0.0
+    fid: float = 0.0
 
 
 @dataclass
@@ -256,24 +256,24 @@ def readCamerasFromTransforms(path, transformsfile, white_background, data_loade
         contents = json.load(json_file)
 
         frames = contents["frames"]
-        # Collect all timestamps
-        timestamps = []
+        # Collect all fids
+        fids = []
         for frame in frames:
             try:
-                timestamps.append(frame["time"])
+                fids.append(frame["time"])
             except:
-                timestamps.append(0.0)
-        # Normalize timestamps to [0, 1]
-        min_time = min(timestamps)
-        max_time = max(timestamps)
+                fids.append(0.0)
+        # Normalize fids to [0, 1]
+        min_time = min(fids)
+        max_time = max(fids)
         if max_time > min_time:
-            norm_timestamps = [(t - min_time) / (max_time - min_time) for t in timestamps]
+            norm_fids = [(t - min_time) / (max_time - min_time) for t in fids]
         else:
-            norm_timestamps = [0.0 for _ in timestamps]
+            norm_fids = [0.0 for _ in fids]
 
         for idx, frame in tqdm(enumerate(frames), total=len(frames)):
             cam_name = os.path.join(path, frame["file_path"] + extension)
-            timestamp = norm_timestamps[idx]
+            fid = norm_fids[idx]
 
             # NeRF 'transform_matrix' is a camera-to-world transform
             c2w = np.array(frame["transform_matrix"])
@@ -333,7 +333,7 @@ def readCamerasFromTransforms(path, transformsfile, white_background, data_loade
                     image_name=image_name,
                     width=width,
                     height=height,
-                    timestamp=timestamp,
+                    fid=fid,
                 )
             )
 
