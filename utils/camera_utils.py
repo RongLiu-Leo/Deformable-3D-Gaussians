@@ -69,7 +69,7 @@ def loadCam(args, id, cam_info, resolution_scale):
         image_name=cam_info.image_name,
         uid=id,
         data_device=args.data_device,
-        timestamp=cam_info.timestamp,
+        fid=cam_info.fid,
         resolution=resolution,
         image_path=cam_info.image_path,
     )
