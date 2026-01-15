@@ -29,7 +29,7 @@ class Camera(nn.Module):
         uid,
         trans=np.array([0.0, 0.0, 0.0]),
         scale=1.0,
-        timestamp=0.0,
+        fid=0.0,
         data_device="cuda",
         resolution=None,
         image_path="",
@@ -44,7 +44,6 @@ class Camera(nn.Module):
         self.FoVy = FoVy
         self.image_name = image_name
         self.image_path = image_path
-        self.timestamp = timestamp
         self.resolution = resolution
 
         try:
@@ -55,7 +54,7 @@ class Camera(nn.Module):
                 f"[Warning] Custom device {data_device} failed, fallback to default cuda device"
             )
             self.data_device = torch.device("cuda")
-
+        self.fid = torch.Tensor(np.array([fid])).to(self.data_device)
         self.original_image = image
         self.image_width = resolution[0]
         self.image_height = resolution[1]
