@@ -18,7 +18,7 @@ from scene.gaussian_model import GaussianModel
 from scene.deform_model import DeformModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
-
+from utils.data_utils import CameraDataset
 
 class Scene:
     gaussians: GaussianModel
@@ -31,6 +31,8 @@ class Scene:
         self.model_path = args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians
+        self.white_background = args.white_background
+        self.data_loader = args.data_loader
 
         if load_iteration:
             if load_iteration == -1:
@@ -46,7 +48,7 @@ class Scene:
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
-            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
+            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, args.data_loader)
         elif os.path.exists(os.path.join(args.source_path, "cameras_sphere.npz")):
             print("Found cameras_sphere.npz file, assuming DTU data set!")
             scene_info = sceneLoadTypeCallbacks["DTU"](args.source_path, "cameras_sphere.npz", "cameras_sphere.npz")
@@ -105,7 +107,7 @@ class Scene:
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
 
     def getTrainCameras(self, scale=1.0):
-        return self.train_cameras[scale]
+        return CameraDataset(self.train_cameras[scale].copy(), self.white_background, self.data_loader)
 
     def getTestCameras(self, scale=1.0):
-        return self.test_cameras[scale]
+        return CameraDataset(self.test_cameras[scale].copy(), self.white_background, self.data_loader)
