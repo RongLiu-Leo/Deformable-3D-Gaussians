@@ -34,9 +34,9 @@ def render_set(model_path, load2gpu_on_the_fly, is_6dof, name, iteration, views,
     makedirs(gts_path, exist_ok=True)
     makedirs(depth_path, exist_ok=True)
 
-    for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        if load2gpu_on_the_fly:
-            view.load2device()
+    for idx, (gt_image, view) in enumerate(tqdm(views, desc="Rendering progress")):
+        gt_image = gt_image.cuda()
+        view = view.cuda()
         fid = view.fid
         xyz = gaussians.get_xyz
         time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
