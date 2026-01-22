@@ -121,7 +121,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "#": f"{gaussians.get_opacity.shape[0]}"})
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -135,8 +135,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
                                        testing_iterations, scene, render, (pipe, background), deform,
                                        dataset.load2gpu_on_the_fly, dataset.is_6dof)
             if iteration in testing_iterations:
-                if cur_psnr.item() > best_psnr:
-                    best_psnr = cur_psnr.item()
+                if cur_psnr > best_psnr:
+                    best_psnr = cur_psnr
                     best_iteration = iteration
 
             if iteration in saving_iterations:
@@ -209,8 +209,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
-                images = torch.tensor([], device="cuda")
-                gts = torch.tensor([], device="cuda")
+                l1_test = 0.0
+                psnr_test = 0.0
                 for idx, (gt_image, viewpoint_cam) in enumerate(config['cameras']):
                     gt_image = gt_image.cuda()
                     viewpoint_cam = viewpoint_cam.cuda()
@@ -221,8 +221,9 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     image = torch.clamp(
                         renderFunc(viewpoint_cam, scene.gaussians, *renderArgs, d_xyz, d_rotation, d_scaling, is_6dof)["render"],
                         0.0, 1.0)
-                    images = torch.cat((images, image.unsqueeze(0)), dim=0)
-                    gts = torch.cat((gts, gt_image.unsqueeze(0)), dim=0)
+
+                    l1_test += l1_loss(image.unsqueeze(0), gt_image.unsqueeze(0)).item()
+                    psnr_test += psnr(image.unsqueeze(0), gt_image.unsqueeze(0)).item()
 
                     if load2gpu_on_the_fly:
                         viewpoint_cam.load2device('cpu')
@@ -233,8 +234,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint_cam.image_name),
                                                  gt_image[None], global_step=iteration)
 
-                l1_test = l1_loss(images, gts)
-                psnr_test = psnr(images, gts).mean()
+                l1_test /= len(config['cameras'])
+                psnr_test /= len(config['cameras'])
                 if config['name'] == 'test' or len(validation_configs[0]['cameras']) == 0:
                     test_psnr = psnr_test
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
@@ -260,7 +261,7 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int,
-                        default=[5000, 6000, 7_000] + list(range(10000, 40001, 1000)))
+                        default=[7_000] + list(range(10000, 40001, 1000)))
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 10_000, 20_000, 30_000, 40000])
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(sys.argv[1:])
