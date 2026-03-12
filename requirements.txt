@@ -6,3 +6,7 @@ imageio-ffmpeg
 scipy
 dearpygui
 lpips
+# Optional: for NeRF-style web viewer (train with --disable_viewer to skip)
+# viser
+# nerfview
+# matplotlib

@@ -10,12 +10,14 @@
 #
 
 import os
+import time
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim, kl_divergence
-from gaussian_renderer import render, network_gui
+from gaussian_renderer import render, view, network_gui
 import sys
 from scene import Scene, GaussianModel, DeformModel
+from scene.gaussian_viewer import GaussianViewer
 from utils.general_utils import safe_state, get_linear_noise_func
 import uuid
 from tqdm import tqdm
@@ -31,8 +33,15 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
+try:
+    import viser
+    VISER_FOUND = True
+except ImportError:
+    VISER_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations):
+
+def training(dataset, opt, pipe, testing_iterations, saving_iterations,
+             disable_viewer=True, viewer_port=8080, share_url=False):
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     deform = DeformModel(dataset.is_blender, dataset.is_6dof)
@@ -44,6 +53,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     batch_size = args.batch_size
+
+    use_viewer = not disable_viewer and VISER_FOUND
+    viewer = None
+    if use_viewer:
+        server = viser.ViserServer(port=viewer_port, verbose=False)
+        viewer = GaussianViewer(
+            server=server,
+            render_fn=view(gaussians, deform, pipe, dataset.is_6dof),
+            is_dynamic=True,
+            mode="training",
+            share_url=share_url,
+        )
 
     iter_start = torch.cuda.Event(enable_timing=True)
     iter_end = torch.cuda.Event(enable_timing=True)
@@ -59,21 +80,27 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
     progress_bar = tqdm(range(opt.iterations), desc="Training progress")
     smooth_term = get_linear_noise_func(lr_init=0.1, lr_final=1e-15, lr_delay_mult=0.01, max_steps=20000)
     for iteration in range(1, opt.iterations + 1):
-        if network_gui.conn == None:
+        if use_viewer:
+            while viewer.state == "paused":
+                time.sleep(0.01)
+            viewer.lock.acquire()
+            tic = time.time()
+        elif network_gui.conn == None:
             network_gui.try_connect()
-        while network_gui.conn != None:
-            try:
-                net_image_bytes = None
-                custom_cam, do_training, pipe.do_shs_python, pipe.do_cov_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
-                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2,
-                                                                                                               0).contiguous().cpu().numpy())
-                network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-                    break
-            except Exception as e:
-                network_gui.conn = None
+        if not use_viewer:
+            while network_gui.conn != None:
+                try:
+                    net_image_bytes = None
+                    custom_cam, do_training, pipe.do_shs_python, pipe.do_cov_python, keep_alive, scaling_modifer = network_gui.receive()
+                    if custom_cam != None:
+                        net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
+                        net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2,
+                                                                                                                   0).contiguous().cpu().numpy())
+                    network_gui.send(net_image_bytes, dataset.source_path)
+                    if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
+                        break
+                except Exception as e:
+                    network_gui.conn = None
 
         iter_start.record()
 
@@ -165,7 +192,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
                 deform.optimizer.zero_grad()
                 deform.update_learning_rate(iteration)
 
+            if use_viewer:
+                num_train_rays_per_step = gt_image.numel()
+                viewer.lock.release()
+                num_train_steps_per_sec = 1.0 / (time.time() - tic + 1e-8)
+                viewer.render_tab_state.num_train_rays_per_sec = num_train_rays_per_step * num_train_steps_per_sec
+                viewer.update(iteration, num_train_rays_per_step)
+
     print("Best PSNR = {} in Iteration {}".format(best_psnr, best_iteration))
+
+    if use_viewer:
+        print("Viewer running... Ctrl+C to exit.")
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            pass
 
 
 def prepare_output_and_logger(args):
@@ -259,6 +301,9 @@ if __name__ == "__main__":
     pp = PipelineParams(parser)
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
+    parser.add_argument('--disable_viewer', action='store_true', help='Disable the web-based Gaussian viewer during training.')
+    parser.add_argument('--viewer_port', type=int, default=8080, help='Port for the Gaussian viewer (when enabled).')
+    parser.add_argument('--share_url', action='store_true', help='Share viewer URL (e.g. ngrok) when viewer is enabled.')
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int,
                         default=[7_000] + list(range(10000, 40001, 1000)))
@@ -275,7 +320,15 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations)
+    if not args.disable_viewer and not VISER_FOUND:
+        print("Viewer requested but viser/nerfview not installed. Install with: pip install viser nerfview")
+    training(
+        lp.extract(args), op.extract(args), pp.extract(args),
+        args.test_iterations, args.save_iterations,
+        disable_viewer=args.disable_viewer,
+        viewer_port=args.viewer_port,
+        share_url=args.share_url,
+    )
 
     # All done
     print("\nTraining complete.")

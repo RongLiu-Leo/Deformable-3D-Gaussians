@@ -13,8 +13,75 @@ import torch
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from scene.gaussian_model import GaussianModel
+from scene.gaussian_viewer import (
+    GaussianRenderTabState,
+    build_viewpoint_camera,
+    apply_depth_colormap,
+    depth_to_normal,
+)
 from utils.sh_utils import eval_sh
 from utils.rigid_utils import from_homogenous, to_homogenous
+
+
+def view(gaussians, deform, pipe, is_6dof=False):
+    """Build a view_fn(camera_state, render_tab_state) for GaussianViewer.
+    Returns a function that renders one frame; use from train.py or view.py.
+    """
+    def view_fn(camera_state, render_tab_state):
+        assert isinstance(render_tab_state, GaussianRenderTabState)
+        if render_tab_state.preview_render:
+            W, H = render_tab_state.render_width, render_tab_state.render_height
+        else:
+            W, H = render_tab_state.viewer_width, render_tab_state.viewer_height
+        W, H = max(64, int(W)), max(64, int(H))
+        cam = build_viewpoint_camera(
+            camera_state,
+            W, H,
+            timestamp=render_tab_state.timestamp,
+            znear=render_tab_state.near_plane,
+            zfar=render_tab_state.far_plane,
+        )
+        bg = torch.tensor(render_tab_state.backgrounds, device="cuda", dtype=torch.float32) / 255.0
+        N = gaussians.get_xyz.shape[0]
+        time_input = cam.fid.unsqueeze(0).expand(N, -1)
+        with torch.no_grad():
+            d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input)
+            render_pkg = render(
+                cam, gaussians, pipe, bg,
+                d_xyz, d_rotation, d_scaling, is_6dof,
+            )
+        render_tab_state.total_count_number = gaussians.get_xyz.shape[0]
+        render_tab_state.rendered_count_number = (render_pkg["radii"] > 0).sum().item()
+
+        render_colors = render_pkg["render"].permute(1, 2, 0)
+        if render_tab_state.render_mode == "Depth":
+            render_colors = render_pkg["depth"].permute(1, 2, 0)
+        elif render_tab_state.render_mode == "Normal":
+            depth_hwc = render_pkg["depth"].permute(1, 2, 0)
+            K = torch.tensor(
+                camera_state.get_K([W, H]),
+                dtype=torch.float32,
+                device=depth_hwc.device,
+            )
+            c2w = torch.tensor(
+                camera_state.c2w,
+                dtype=torch.float32,
+                device=depth_hwc.device,
+            )
+            normals = depth_to_normal(
+                depth_hwc.unsqueeze(0),
+                c2w.unsqueeze(0),
+                K.unsqueeze(0),
+                z_depth=True,
+            )
+            render_colors = (normals.squeeze(0) + 1.0) / 2.0
+
+        if render_colors.shape[-1] == 1:
+            render_colors = apply_depth_colormap(render_colors)
+
+        return torch.clamp(render_colors, 0.0, 1.0).cpu().numpy()
+
+    return view_fn
 
 
 def quaternion_multiply(q1, q2):
